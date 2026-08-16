@@ -468,15 +468,27 @@ def handle_withdraw(message):
     )
 
 
+def format_user_identity(u):
+    """Human-friendly identity string: Full Name (@username) — used across
+    admin views so admins always see the person's real name, not just an ID."""
+    name = u.get("first_name") or "(គ្មានឈ្មោះ)"
+    username = u.get("username")
+    if username:
+        return f"{name} (@{username})"
+    return name
+
+
 def notify_admins_withdraw(w):
     kb = types.InlineKeyboardMarkup()
     kb.row(
         types.InlineKeyboardButton("✅ អនុម័ត", callback_data=f"wapprove_{w['id']}"),
         types.InlineKeyboardButton("❌ បដិសេធ", callback_data=f"wreject_{w['id']}"),
     )
+    identity = format_user_identity(w)
     caption = (
         "📥 <b>សំណើដកលុយថ្មី</b>\n\n"
-        f"👤 User: {w['username'] or w['first_name']} (<code>{w['user_id']}</code>)\n"
+        f"👤 ឈ្មោះ: <b>{identity}</b>\n"
+        f"🔗 <a href='tg://user?id={w['user_id']}'>មើលប្រវត្តិរូប</a> — 🆔 <code>{w['user_id']}</code>\n"
         f"💵 ចំនួន: ${w['amount']:.2f}\n"
         f"📱 ព័ត៌មានទទួល: <code>{w.get('info') or '(មិនបានវាយអត្ថបទ សូមមើលរូបភាព QR)'}</code>\n"
         f"🆔 Request ID: <code>{w['id']}</code>"
@@ -600,7 +612,9 @@ def admin_menu():
     kb.row(types.InlineKeyboardButton("📢 ផ្សព្វផ្សាយសារ", callback_data="a_broadcast"))
     kb.row(types.InlineKeyboardButton("⚙️ កំណត់ Channel", callback_data="a_setchannel"))
     kb.row(types.InlineKeyboardButton("💳 កែសមតុល្យ User", callback_data="a_addbalance"))
+    kb.row(types.InlineKeyboardButton("➖ កាត់លុយ User", callback_data="a_deduct"))
     kb.row(types.InlineKeyboardButton("↩️ ណែនាំដែលត្រូវបានដកវិញ", callback_data="a_flagged"))
+    kb.row(types.InlineKeyboardButton("🔍 រកមើល User", callback_data="a_lookup"))
     return kb
 
 
@@ -655,7 +669,8 @@ def cb_admin_menu(call):
                     types.InlineKeyboardButton("❌ បដិសេធ", callback_data=f"wreject_{w['id']}"),
                 )
                 caption = (
-                    f"👤 {w['username'] or w['first_name']} (<code>{w['user_id']}</code>)\n"
+                    f"👤 <b>{format_user_identity(w)}</b>\n"
+                    f"🔗 <a href='tg://user?id={w['user_id']}'>មើលប្រវត្តិរូប</a> — 🆔 <code>{w['user_id']}</code>\n"
                     f"💵 ${w['amount']:.2f}\n"
                     f"📱 <code>{w.get('info') or '(មើលរូបភាព QR ខាងលើ)'}</code>\n"
                     f"🆔 <code>{w['id']}</code>"
@@ -682,8 +697,24 @@ def cb_admin_menu(call):
         bot.send_message(
             call.message.chat.id,
             "💳 សូមផ្ញើតាមទម្រង់៖ <code>user_id ចំនួនទឹកប្រាក់</code>\n"
-            "ឧទាហរណ៍៖ <code>8266854899 1.50</code> (អាចដាក់ចំនួនអវិជ្ជមានដើម្បីកាត់)",
+            "ឧទាហរណ៍៖ <code>8266854899 1.50</code> (បន្ថែមលុយចូលសមតុល្យ)",
         )
+
+    elif action == "a_deduct":
+        users = load_users()
+        candidates = sorted(
+            [u for u in users.values() if u.get("balance", 0.0) > 0],
+            key=lambda u: u.get("balance", 0.0),
+            reverse=True,
+        )[:20]
+        if not candidates:
+            bot.send_message(call.message.chat.id, "➖ គ្មាន User ណាមានសមតុល្យទេ។")
+        else:
+            kb = types.InlineKeyboardMarkup()
+            for u in candidates:
+                label = f"{format_user_identity(u)} — ${u.get('balance', 0.0):.2f}"
+                kb.add(types.InlineKeyboardButton(label, callback_data=f"duser_{u['id']}"))
+            bot.send_message(call.message.chat.id, "➖ ជ្រើសរើស User ដែលអ្នកចង់កាត់លុយ៖", reply_markup=kb)
 
     elif action == "a_flagged":
         users = load_users()
@@ -693,9 +724,15 @@ def cb_admin_menu(call):
         else:
             lines = ["↩️ <b>ណែនាំដែលត្រូវបានដកវិញ (ចាកចេញ Channel មុនផុត Grace Period)</b>\n"]
             for u in reverted:
-                name = u.get("username") and f"@{u['username']}" or (u.get("first_name") or "")
-                lines.append(f"• {name} — ID: <code>{u['id']}</code> — Referrer: <code>{u.get('referred_by')}</code>")
+                lines.append(f"• {format_user_identity(u)} — ID: <code>{u['id']}</code> — Referrer: <code>{u.get('referred_by')}</code>")
             bot.send_message(call.message.chat.id, "\n".join(lines))
+
+    elif action == "a_lookup":
+        STATE[call.from_user.id] = {"step": "awaiting_lookup"}
+        bot.send_message(
+            call.message.chat.id,
+            "🔍 សូមផ្ញើ <b>User ID</b> ឬ <b>@username</b> ដែលអ្នកចង់រកមើល៖",
+        )
 
     bot.answer_callback_query(call.id)
 
@@ -751,6 +788,111 @@ def handle_addbalance(message):
         bot.send_message(target_id, f"💳 សមតុល្យរបស់អ្នកត្រូវបានកែសម្រួល។ សមតុល្យថ្មី: ${new_balance:.2f}")
     except Exception:
         pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("duser_"))
+def cb_deduct_pick_user(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ គ្មានសិទ្ធិ", show_alert=True)
+        return
+    target_id = int(call.data.split("_", 1)[1])
+    user = get_user(target_id)
+    balance = user.get("balance", 0.0)
+
+    presets = [0.20, 0.50, 1.00, 2.50]
+    kb = types.InlineKeyboardMarkup()
+    row = []
+    for amt in presets:
+        if amt <= balance + 0.0001:
+            row.append(types.InlineKeyboardButton(f"-${amt:.2f}", callback_data=f"damt_{target_id}_{int(round(amt*100))}"))
+    if row:
+        kb.row(*row)
+    kb.row(types.InlineKeyboardButton(f"-${balance:.2f} (កាត់ទាំងអស់)", callback_data=f"damt_{target_id}_{int(round(balance*100))}"))
+    kb.row(types.InlineKeyboardButton("❌ បោះបង់", callback_data="damt_cancel"))
+
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        f"➖ កាត់លុយពី <b>{format_user_identity(user)}</b>\n"
+        f"💰 សមតុល្យបច្ចុប្បន្ន: ${balance:.2f}\n\n"
+        "ជ្រើសរើសចំនួនទឹកប្រាក់ដែលចង់កាត់៖",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=kb,
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("damt_"))
+def cb_deduct_confirm(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ គ្មានសិទ្ធិ", show_alert=True)
+        return
+    if call.data == "damt_cancel":
+        bot.answer_callback_query(call.id, "បានបោះបង់")
+        bot.edit_message_text("➖ បានបោះបង់ការកាត់លុយ។", call.message.chat.id, call.message.message_id)
+        return
+
+    _, target_id_str, cents_str = call.data.split("_")
+    target_id = int(target_id_str)
+    amount = int(cents_str) / 100.0
+
+    user = get_user(target_id)
+    new_balance = max(0.0, round(user["balance"] - amount, 2))
+    update_user(target_id, balance=new_balance)
+    log_referral_event({"type": "admin_deduct", "admin": call.from_user.id, "user": target_id, "amount": amount})
+
+    bot.answer_callback_query(call.id, "✅ បានកាត់លុយ")
+    bot.edit_message_text(
+        f"✅ បានកាត់ <b>${amount:.2f}</b> ពី {format_user_identity(user)} (<code>{target_id}</code>)\n"
+        f"💰 សមតុល្យថ្មី: ${new_balance:.2f}",
+        call.message.chat.id,
+        call.message.message_id,
+    )
+    try:
+        bot.send_message(
+            target_id,
+            f"⚠️ សមតុល្យរបស់អ្នកត្រូវបានកាត់ <b>${amount:.2f}</b>។\n"
+            "មូលហេតុ៖ ប្រព័ន្ធរកឃើញភាពមិនប្រក្រតីលើគណនីរបស់អ្នក។\n"
+            f"💰 សមតុល្យថ្មី: ${new_balance:.2f}\n\n"
+            "សូមទាក់ទង Admin ប្រសិនបើអ្នកគិតថាមានកំហុស។",
+        )
+    except Exception:
+        pass
+
+
+@bot.message_handler(func=lambda m: STATE.get(m.from_user.id, {}).get("step") == "awaiting_lookup")
+def handle_lookup(message):
+    if not is_admin(message.from_user.id):
+        return
+    STATE.pop(message.from_user.id, None)
+    query = message.text.strip().lstrip("@")
+    users = load_users()
+
+    target = None
+    if query.isdigit():
+        target = users.get(query)
+    if not target:
+        for u in users.values():
+            if (u.get("username") or "").lower() == query.lower():
+                target = u
+                break
+
+    if not target:
+        bot.send_message(message.chat.id, "❌ រកមិនឃើញ user នេះទេ។")
+        return
+
+    referrer = get_user(target["referred_by"]) if target.get("referred_by") else None
+    bot.send_message(
+        message.chat.id,
+        "👤 <b>ព័ត៌មាន User</b>\n\n"
+        f"ឈ្មោះ: <b>{format_user_identity(target)}</b>\n"
+        f"🔗 <a href='tg://user?id={target['id']}'>មើលប្រវត្តិរូប</a>\n"
+        f"🆔 ID: <code>{target['id']}</code>\n"
+        f"💰 សមតុល្យ: ${target.get('balance', 0.0):.2f}\n"
+        f"👥 ចំនួនអ្នកបានណែនាំ: {target.get('referral_count', 0)}\n"
+        f"✅ បានចូល Channel: {'បាទ/ចាស' if target.get('joined_channel') else 'ទេ'}\n"
+        f"👤 ត្រូវបានណែនាំដោយ: {format_user_identity(referrer) if referrer else '(គ្មាន)'}\n"
+        f"📅 បង្កើតគណនី: {target.get('created_at', '')[:10]}",
+    )
 
 
 # ------------------------------------------------------------------
