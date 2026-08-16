@@ -820,4 +820,14 @@ def run_flask():
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     log.info("Bot starting... admins=%s", ADMIN_IDS)
-    bot.infinity_polling(skip_pending=True)
+
+    # If another instance (local Termux, an old Render deploy, etc.) is still
+    # polling with the same BOT_TOKEN, Telegram returns 409 Conflict and
+    # infinity_polling would exit. Instead of crash-looping, back off and retry —
+    # this self-heals once the other instance stops.
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+        except Exception as e:
+            log.error("Polling crashed: %s — retrying in 15s", e)
+            time.sleep(15)
