@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Kairozen Referral Bot
+Kai រកលុយ — Referral Bot
 - ណែនាំមិត្ត 1 នាក់ = $0.20
 - ដកលុយអប្បបរមា = $2.50
 - តម្រូវឲ្យចូល Channel មុននឹងទទួលបានប្រាក់ណែនាំ (Force-Subscribe)
+- អត្តសញ្ញាណ user កំណត់ដោយ Telegram user ID ប៉ុណ្ណោះ (មិនតម្រូវលេខទូរស័ព្ទ)
+- Grace-period watchdog: ប្រាក់ណែនាំក្លាយជាស្ថាពរលុះត្រាតែអ្នកត្រូវបានណែនាំនៅតែក្នុង Channel
 - មាន Admin Panel ពេញលេញ
 Stack: pyTelegramBotAPI + Flask keep-alive + JSON persistence (DATA_DIR) — same pattern
 used across Kairozen bots, ready for Render deployment.
@@ -32,6 +34,8 @@ BOT_DISPLAY_NAME = os.environ.get("BOT_DISPLAY_NAME", "Kai រកលុយ")
 
 REFERRAL_BONUS = float(os.environ.get("REFERRAL_BONUS", "0.20"))
 MIN_WITHDRAW = float(os.environ.get("MIN_WITHDRAW", "2.50"))
+REFERRAL_GRACE_HOURS = float(os.environ.get("REFERRAL_GRACE_HOURS", "24"))
+WATCHDOG_INTERVAL_MINUTES = float(os.environ.get("WATCHDOG_INTERVAL_MINUTES", "60"))
 
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -39,7 +43,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 WITHDRAW_FILE = os.path.join(DATA_DIR, "withdrawals.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
-PHONES_FILE = os.path.join(DATA_DIR, "phones.json")
 REFERRAL_LOG_FILE = os.path.join(DATA_DIR, "referral_log.json")
 
 logging.basicConfig(
@@ -102,14 +105,6 @@ def save_settings(d):
     _save(SETTINGS_FILE, d)
 
 
-def load_phones():
-    return _load(PHONES_FILE, {})
-
-
-def save_phones(d):
-    _save(PHONES_FILE, d)
-
-
 def load_referral_log():
     return _load(REFERRAL_LOG_FILE, [])
 
@@ -119,14 +114,6 @@ def log_referral_event(event):
     event["ts"] = datetime.utcnow().isoformat()
     logs.append(event)
     _save(REFERRAL_LOG_FILE, logs)
-
-
-def normalize_phone(raw):
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    # normalize Cambodian numbers: 0xxxxxxxx <-> 855xxxxxxxx
-    if digits.startswith("855"):
-        digits = "0" + digits[3:]
-    return digits
 
 
 def get_user(user_id, username=None, first_name=None):
@@ -142,9 +129,9 @@ def get_user(user_id, username=None, first_name=None):
             "referral_count": 0,
             "joined_channel": False,
             "pending_referrer": None,
-            "phone_number": None,
-            "phone_verified": False,
-            "flagged_duplicate_phone": False,
+            "referral_credited_at": None,
+            "referral_verified": False,
+            "referral_reverted": False,
             "created_at": datetime.utcnow().isoformat(),
         }
         save_users(users)
@@ -207,12 +194,6 @@ def join_channel_markup():
     return kb
 
 
-def phone_request_markup():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    kb.add(types.KeyboardButton("📱 ផ្ញើលេខទូរស័ព្ទរបស់ខ្ញុំ", request_contact=True))
-    return kb
-
-
 # ------------------------------------------------------------------
 # MAIN MENU
 # ------------------------------------------------------------------
@@ -229,23 +210,16 @@ def referral_link(user_id):
     return f"https://t.me/{me.username}?start=ref{user_id}"
 
 
-def prompt_phone_verification(chat_id):
-    bot.send_message(
-        chat_id,
-        "🔒 <b>ជំហានចុងក្រោយ៖ ផ្ទៀងផ្ទាត់គណនី</b>\n\n"
-        "ដើម្បីការពារការក្លែងបន្លំ (គណនីក្លែងក្លាយ/ច្រើនគណនី) សូមចុចប៊ូតុងខាងក្រោម "
-        "ដើម្បីផ្ញើលេខទូរស័ព្ទផ្ទាល់ខ្លួនរបស់អ្នក។ លេខទូរស័ព្ទនីមួយៗអាចប្រើបានតែម្តងគត់។",
-        reply_markup=phone_request_markup(),
-    )
-
-
 def finalize_referral(user_id):
-    """Credit the referrer only when the referred user has BOTH joined the
-    channel AND passed unique-phone verification. Idempotent & fraud-guarded."""
+    """Credit the referrer once the referred user has joined the channel.
+    Idempotent & fraud-guarded (self-referral blocked, credited once per user).
+    The bonus starts in a grace period — see referral_watchdog() — and is only
+    made permanent if the referred user is STILL in the channel after
+    REFERRAL_GRACE_HOURS. This stops the "join → get friend paid → leave"
+    exploit. Identity is tracked purely by Telegram user ID (no phone
+    number required)."""
     user = get_user(user_id)
-    if not (user.get("joined_channel") and user.get("phone_verified")):
-        return
-    if user.get("flagged_duplicate_phone"):
+    if not user.get("joined_channel"):
         return
     if user.get("referred_by") is not None:
         return
@@ -253,22 +227,80 @@ def finalize_referral(user_id):
     if not ref_id or ref_id == user_id:
         return
     referrer = get_user(ref_id)
-    if referrer.get("flagged_duplicate_phone"):
-        return
     new_balance = round(referrer["balance"] + REFERRAL_BONUS, 2)
     update_user(ref_id, balance=new_balance, referral_count=referrer.get("referral_count", 0) + 1)
-    update_user(user_id, referred_by=ref_id, pending_referrer=None)
+    update_user(
+        user_id,
+        referred_by=ref_id,
+        pending_referrer=None,
+        referral_credited_at=datetime.utcnow().isoformat(),
+        referral_verified=False,
+        referral_reverted=False,
+    )
     log_referral_event(
-        {"type": "credit", "referrer": ref_id, "referred": user_id, "amount": REFERRAL_BONUS}
+        {"type": "credit_pending", "referrer": ref_id, "referred": user_id, "amount": REFERRAL_BONUS}
     )
     try:
         bot.send_message(
             ref_id,
-            f"🎉 អ្នកទទួលបានប្រាក់ណែនាំថ្មី <b>${REFERRAL_BONUS:.2f}</b> (បានផ្ទៀងផ្ទាត់រួច)!\n"
-            f"💰 សមតុល្យថ្មី: <b>${new_balance:.2f}</b>",
+            f"🎉 អ្នកទទួលបានប្រាក់ណែនាំថ្មី <b>${REFERRAL_BONUS:.2f}</b>!\n"
+            f"💰 សមតុល្យថ្មី: <b>${new_balance:.2f}</b>\n\n"
+            f"⏳ ចំណាំ៖ ប្រាក់នេះនឹងក្លាយជាស្ថាពរបន្ទាប់ពី {int(REFERRAL_GRACE_HOURS)} ម៉ោង "
+            "ប្រសិនបើមិត្តភ័ក្តិដែលអ្នកបានណែនាំនៅតែស្ថិតនៅក្នុង Channel។",
         )
     except Exception:
         pass
+
+
+def referral_watchdog():
+    """Background loop: after the grace period, re-checks that each referred
+    user is still a channel member. Still there -> confirm bonus permanently.
+    Left the channel -> claw back the bonus from the referrer."""
+    while True:
+        try:
+            users = load_users()
+            now = datetime.utcnow()
+            for uid, u in list(users.items()):
+                if u.get("referral_verified") or u.get("referral_reverted"):
+                    continue
+                credited_at = u.get("referral_credited_at")
+                ref_id = u.get("referred_by")
+                if not credited_at or not ref_id:
+                    continue
+                try:
+                    elapsed_hours = (now - datetime.fromisoformat(credited_at)).total_seconds() / 3600
+                except ValueError:
+                    continue
+                if elapsed_hours < REFERRAL_GRACE_HOURS:
+                    continue
+
+                still_member = is_member_of_channel(int(uid))
+                if still_member:
+                    update_user(int(uid), referral_verified=True)
+                    log_referral_event({"type": "credit_confirmed", "referrer": ref_id, "referred": int(uid)})
+                else:
+                    referrer = get_user(ref_id)
+                    reverted_balance = max(0.0, round(referrer["balance"] - REFERRAL_BONUS, 2))
+                    update_user(
+                        ref_id,
+                        balance=reverted_balance,
+                        referral_count=max(0, referrer.get("referral_count", 0) - 1),
+                    )
+                    update_user(int(uid), referral_verified=True, referral_reverted=True)
+                    log_referral_event(
+                        {"type": "credit_reverted", "referrer": ref_id, "referred": int(uid), "amount": REFERRAL_BONUS}
+                    )
+                    try:
+                        bot.send_message(
+                            ref_id,
+                            f"⚠️ ប្រាក់ណែនាំ <b>${REFERRAL_BONUS:.2f}</b> ត្រូវបានដកចេញវិញ ព្រោះមិត្តភ័ក្តិដែលអ្នកបានណែនាំបានចាកចេញពី Channel។\n"
+                            f"💰 សមតុល្យថ្មី: <b>${reverted_balance:.2f}</b>",
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            log.exception("referral_watchdog iteration failed")
+        time.sleep(WATCHDOG_INTERVAL_MINUTES * 60)
 
 
 # ------------------------------------------------------------------
@@ -308,18 +340,6 @@ def handle_start(message):
         )
         return
 
-    if not user.get("phone_verified"):
-        prompt_phone_verification(message.chat.id)
-        return
-
-    if user.get("flagged_duplicate_phone"):
-        bot.send_message(
-            message.chat.id,
-            "🚫 គណនីរបស់អ្នកកំពុងត្រូវបានពិនិត្យ ដោយសារលេខទូរស័ព្ទដូចគ្នាត្រូវបានប្រើដោយគណនីផ្សេង។\n"
-            "សូមទាក់ទង Admin ប្រសិនបើអ្នកគិតថាមានកំហុស។",
-        )
-        return
-
     bot.send_message(
         message.chat.id,
         f"👋 សួស្តី {first_name}! សូមស្វាគមន៍មកកាន់ <b>{BOT_DISPLAY_NAME}</b> 💰\n"
@@ -332,82 +352,23 @@ def handle_start(message):
 def cb_check_join(call):
     user_id = call.from_user.id
     if is_member_of_channel(user_id):
-        user = get_user(user_id, call.from_user.username, call.from_user.first_name)
         update_user(user_id, joined_channel=True)
         finalize_referral(user_id)
 
         bot.answer_callback_query(call.id, "✅ អ្នកបានចូល Channel រួចហើយ!")
-        user = get_user(user_id)
-        if not user.get("phone_verified"):
-            prompt_phone_verification(call.message.chat.id)
-        else:
-            bot.send_message(
-                call.message.chat.id,
-                f"✅ ជោគជ័យ! សូមស្វាគមន៍មកកាន់ <b>{BOT_DISPLAY_NAME}</b> សូមប្រើម៉ឺនុយខាងក្រោម៖",
-                reply_markup=main_menu(),
-            )
+        bot.send_message(
+            call.message.chat.id,
+            f"✅ ជោគជ័យ! សូមស្វាគមន៍មកកាន់ <b>{BOT_DISPLAY_NAME}</b> សូមប្រើម៉ឺនុយខាងក្រោម៖",
+            reply_markup=main_menu(),
+        )
     else:
         bot.answer_callback_query(
             call.id, "❌ អ្នកមិនទាន់បានចូល Channel ទេ សូមចូលរួមសិន!", show_alert=True
         )
 
 
-@bot.message_handler(content_types=["contact"])
-def handle_contact(message):
-    user_id = message.from_user.id
-    contact = message.contact
-
-    if contact.user_id != user_id:
-        bot.send_message(
-            message.chat.id,
-            "❌ សូមផ្ញើលេខទូរស័ព្ទផ្ទាល់ខ្លួនរបស់អ្នកប៉ុណ្ណោះ (ប្រើប៊ូតុងខាងក្រោម)។",
-            reply_markup=phone_request_markup(),
-        )
-        return
-
-    phone = normalize_phone(contact.phone_number)
-    phones = load_phones()
-    existing_owner = phones.get(phone)
-
-    if existing_owner and str(existing_owner) != str(user_id):
-        update_user(user_id, phone_number=phone, phone_verified=False, flagged_duplicate_phone=True)
-        log_referral_event(
-            {"type": "duplicate_phone_blocked", "user": user_id, "phone": phone, "existing_owner": existing_owner}
-        )
-        bot.send_message(
-            message.chat.id,
-            "🚫 លេខទូរស័ព្ទនេះត្រូវបានប្រើប្រាស់ដោយគណនីផ្សេងរួចហើយ។\n"
-            "ដើម្បីការពារការក្លែងបន្លំ គណនីនេះនឹងមិនអាចទទួល ឬបង្កើតប្រាក់ណែនាំបានទេ។\n"
-            "សូមទាក់ទង Admin ប្រសិនបើអ្នកគិតថាមានកំហុស។",
-            reply_markup=types.ReplyKeyboardRemove(),
-        )
-        for admin_id in ADMIN_IDS:
-            try:
-                bot.send_message(
-                    admin_id,
-                    "🚩 <b>រកឃើញលេខទូរស័ព្ទស្ទួន</b>\n"
-                    f"User: <code>{user_id}</code>\n"
-                    f"Phone: <code>{phone}</code>\n"
-                    f"គណនីដើម: <code>{existing_owner}</code>",
-                )
-            except Exception:
-                pass
-        return
-
-    phones[phone] = user_id
-    save_phones(phones)
-    update_user(user_id, phone_number=phone, phone_verified=True, flagged_duplicate_phone=False)
-    finalize_referral(user_id)
-
-    bot.send_message(
-        message.chat.id,
-        "✅ ផ្ទៀងផ្ទាត់លេខទូរស័ព្ទជោគជ័យ! សូមប្រើម៉ឺនុយខាងក្រោម៖",
-        reply_markup=main_menu(),
-    )
-
-
 # ------------------------------------------------------------------
-# GATE: block everything else until user has joined channel + verified phone
+# GATE: block everything else until user has joined the channel
 # ------------------------------------------------------------------
 def require_joined(message):
     user = get_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
@@ -418,15 +379,6 @@ def require_joined(message):
             message.chat.id,
             "⚠️ សូមចូលរួម Channel មុនសិន៖",
             reply_markup=join_channel_markup(),
-        )
-        return False
-    if not user.get("phone_verified"):
-        prompt_phone_verification(message.chat.id)
-        return False
-    if user.get("flagged_duplicate_phone"):
-        bot.send_message(
-            message.chat.id,
-            "🚫 គណនីរបស់អ្នកកំពុងត្រូវបានពិនិត្យ។ សូមទាក់ទង Admin។",
         )
         return False
     return True
@@ -648,7 +600,7 @@ def admin_menu():
     kb.row(types.InlineKeyboardButton("📢 ផ្សព្វផ្សាយសារ", callback_data="a_broadcast"))
     kb.row(types.InlineKeyboardButton("⚙️ កំណត់ Channel", callback_data="a_setchannel"))
     kb.row(types.InlineKeyboardButton("💳 កែសមតុល្យ User", callback_data="a_addbalance"))
-    kb.row(types.InlineKeyboardButton("🚩 គណនីសង្ស័យ (ស្ទួនលេខ)", callback_data="a_flagged"))
+    kb.row(types.InlineKeyboardButton("↩️ ណែនាំដែលត្រូវបានដកវិញ", callback_data="a_flagged"))
     return kb
 
 
@@ -671,8 +623,11 @@ def cb_admin_menu(call):
         withdrawals = load_withdrawals()
         total_users = len(users)
         joined = sum(1 for u in users.values() if u.get("joined_channel"))
-        verified = sum(1 for u in users.values() if u.get("phone_verified"))
-        flagged = sum(1 for u in users.values() if u.get("flagged_duplicate_phone"))
+        pending_grace = sum(
+            1 for u in users.values()
+            if u.get("referred_by") and not u.get("referral_verified") and not u.get("referral_reverted")
+        )
+        reverted = sum(1 for u in users.values() if u.get("referral_reverted"))
         total_balance = sum(u.get("balance", 0.0) for u in users.values())
         total_paid = sum(w["amount"] for w in withdrawals if w["status"] == "approved")
         pending_count = sum(1 for w in withdrawals if w["status"] == "pending")
@@ -681,8 +636,8 @@ def cb_admin_menu(call):
             "📊 <b>ស្ថិតិទូទៅ</b>\n\n"
             f"👥 សរុប Users: {total_users}\n"
             f"✅ បានចូល Channel: {joined}\n"
-            f"📱 បានផ្ទៀងផ្ទាត់លេខទូរស័ព្ទ: {verified}\n"
-            f"🚩 សង្ស័យក្លែងបន្លំ: {flagged}\n"
+            f"⏳ ណែនាំកំពុងរង់ចាំផ្ទៀងផ្ទាត់ ({int(REFERRAL_GRACE_HOURS)}ម៉ោង): {pending_grace}\n"
+            f"↩️ ប្រាក់ណែនាំត្រូវបានដកវិញ (ចាកចេញ Channel): {reverted}\n"
             f"💰 សមតុល្យសរុប (មិនទាន់ដក): ${total_balance:.2f}\n"
             f"💸 បានបង់ចេញសរុប: ${total_paid:.2f}\n"
             f"📋 សំណើកំពុងរង់ចាំ: {pending_count}",
@@ -732,14 +687,14 @@ def cb_admin_menu(call):
 
     elif action == "a_flagged":
         users = load_users()
-        flagged = [u for u in users.values() if u.get("flagged_duplicate_phone")]
-        if not flagged:
-            bot.send_message(call.message.chat.id, "🚩 គ្មានគណនីសង្ស័យទេ។")
+        reverted = [u for u in users.values() if u.get("referral_reverted")]
+        if not reverted:
+            bot.send_message(call.message.chat.id, "↩️ គ្មានប្រាក់ណែនាំដែលត្រូវបានដកវិញទេ។")
         else:
-            lines = ["🚩 <b>គណនីសង្ស័យ (លេខទូរស័ព្ទស្ទួន)</b>\n"]
-            for u in flagged:
+            lines = ["↩️ <b>ណែនាំដែលត្រូវបានដកវិញ (ចាកចេញ Channel មុនផុត Grace Period)</b>\n"]
+            for u in reverted:
                 name = u.get("username") and f"@{u['username']}" or (u.get("first_name") or "")
-                lines.append(f"• {name} — ID: <code>{u['id']}</code> — Phone: <code>{u.get('phone_number')}</code>")
+                lines.append(f"• {name} — ID: <code>{u['id']}</code> — Referrer: <code>{u.get('referred_by')}</code>")
             bot.send_message(call.message.chat.id, "\n".join(lines))
 
     bot.answer_callback_query(call.id)
@@ -819,6 +774,7 @@ def run_flask():
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=referral_watchdog, daemon=True).start()
     log.info("Bot starting... admins=%s", ADMIN_IDS)
 
     # If another instance (local Termux, an old Render deploy, etc.) is still
